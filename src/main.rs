@@ -1,4 +1,9 @@
-use std::{fs::File, io::Read, net::{Ipv4Addr, UdpSocket}, os::raw};
+use std::{
+    fs::File,
+    io::Read,
+    net::{Ipv4Addr, Ipv6Addr, UdpSocket},
+    os::raw,
+};
 
 pub struct BytePacketBuffer {
     pub buf: [u8; 512],
@@ -55,6 +60,15 @@ impl BytePacketBuffer {
         Ok(self.buf[pos])
     }
 
+    fn set(&mut self, pos: usize, val: u8) -> Result<(), String> {
+        if pos >= self.buf.len() {
+            return Err("Index out of bounds".into());
+        }
+        self.buf[pos] = val;
+
+        Ok(())
+    }
+
     fn write_u8(&mut self, val: u8) -> Result<(), ()> {
         self.write(val).unwrap();
 
@@ -77,6 +91,15 @@ impl BytePacketBuffer {
     fn write_u16(&mut self, val: u16) -> Result<(), ()> {
         self.write((val >> 8) as u8).unwrap();
         self.write((val & 0xFF) as u8).unwrap();
+        Ok(())
+    }
+
+    fn set_u16(&mut self, pos: usize, val: u16) -> Result<(), String> {
+        if pos + 1 > self.buf.len() {
+            return Err("Index out of bounds".into());
+        }
+        self.set(pos, (val >> 8) as u8).unwrap();
+        self.set(pos + 1, (val & 0xFF) as u8).unwrap();
         Ok(())
     }
 
@@ -303,7 +326,10 @@ impl DnsHeader {
 pub enum QueryType {
     UNKNOWN(u16),
     A,
-    
+    NS,
+    CNAME,
+    MX,
+    AAAA,
 }
 
 impl QueryType {
@@ -311,12 +337,20 @@ impl QueryType {
         match *self {
             QueryType::UNKNOWN(v) => v,
             QueryType::A => 1,
+            QueryType::NS => 2,
+            QueryType::CNAME => 5,
+            QueryType::MX => 15,
+            QueryType::AAAA => 28,
         }
     }
 
     pub fn from_u16(value: u16) -> QueryType {
         match value {
             1 => QueryType::A,
+            2 => QueryType::NS,
+            5 => QueryType::CNAME,
+            15 => QueryType::MX,
+            28 => QueryType::AAAA,
             _ => QueryType::UNKNOWN(value),
         }
     }
@@ -325,7 +359,7 @@ impl QueryType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DnsQuestion {
     pub name: String,
-    pub qtype: QueryType
+    pub qtype: QueryType,
 }
 
 impl DnsQuestion {
@@ -343,7 +377,7 @@ impl DnsQuestion {
 
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<(), ()> {
         buffer.write_qname(&self.name).unwrap();
-        
+
         let typenum = self.qtype.to_u16();
         buffer.write_u16(typenum).unwrap();
         buffer.write_u16(1).unwrap();
@@ -365,7 +399,28 @@ pub enum DnsRecord {
         domain: String,
         addr: Ipv4Addr,
         ttl: u32,
-    }
+    },
+    NS {
+        domain: String,
+        host: String,
+        ttl: u32,
+    },
+    CNAME {
+        domain: String,
+        host: String,
+        ttl: u32,
+    },
+    MX {
+        domain: String,
+        host: String,
+        priority: u16,
+        ttl: u32,
+    },
+    AAAA {
+        domain: String,
+        addr: Ipv6Addr,
+        ttl: u32,
+    },
 }
 
 impl DnsRecord {
@@ -389,12 +444,59 @@ impl DnsRecord {
                 );
                 Ok(DnsRecord::A { domain, addr, ttl })
             }
-            _ => Ok(DnsRecord::UNKNOWN {
-                domain,
-                qtype,
-                data_len,
-                ttl,
-            }),
+            QueryType::AAAA => {
+                let raw_addr1 = buffer.read_u32().unwrap();
+                let raw_addr2 = buffer.read_u32().unwrap();
+                let raw_addr3 = buffer.read_u32().unwrap();
+                let raw_addr4 = buffer.read_u32().unwrap();
+                let addr = Ipv6Addr::new(
+                    ((raw_addr1 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr1 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr2 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr2 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr3 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr3 >> 0) & 0xFFFF) as u16,
+                    ((raw_addr4 >> 16) & 0xFFFF) as u16,
+                    ((raw_addr4 >> 0) & 0xFFFF) as u16,
+                );
+
+                Ok(DnsRecord::AAAA {
+                    domain: domain,
+                    addr: addr,
+                    ttl: ttl,
+                })
+            }
+            QueryType::NS => {
+                let mut host = String::new();
+                buffer.read_qname(&mut host).unwrap();
+                Ok(DnsRecord::NS { domain, host, ttl })
+            }
+            QueryType::CNAME => {
+                let mut host = String::new();
+                buffer.read_qname(&mut host).unwrap();
+                Ok(DnsRecord::CNAME { domain, host, ttl })
+            }
+            QueryType::MX => {
+                let priority = buffer.read_u16().unwrap();
+                let mut host = String::new();
+                buffer.read_qname(&mut host).unwrap();
+
+                Ok(DnsRecord::MX {
+                    domain,
+                    host,
+                    priority,
+                    ttl,
+                })
+            }
+            QueryType::UNKNOWN(_) => {
+                buffer.step(data_len as usize).unwrap();
+                Ok(DnsRecord::UNKNOWN {
+                    domain,
+                    qtype,
+                    data_len,
+                    ttl,
+                })
+            }
         }
     }
 
@@ -418,6 +520,77 @@ impl DnsRecord {
                 buffer.write_u8(octets[1]).unwrap();
                 buffer.write_u8(octets[2]).unwrap();
                 buffer.write_u8(octets[3]).unwrap();
+            }
+            DnsRecord::NS {
+                ref domain,
+                ref host,
+                ttl,
+            } => {
+                buffer.write_qname(domain).unwrap();
+                buffer.write_u16(QueryType::NS.to_u16()).unwrap();
+                buffer.write_u16(1).unwrap();
+                buffer.write_u32(ttl).unwrap();
+
+                let pos = buffer.pos();
+                buffer.write_u16(0).unwrap();
+
+                buffer.write_qname(host).unwrap();
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16).unwrap();
+            }
+            DnsRecord::CNAME {
+                ref domain,
+                ref host,
+                ttl,
+            } => {
+                buffer.write_qname(domain).unwrap();
+                buffer.write_u16(QueryType::CNAME.to_u16()).unwrap();
+                buffer.write_u16(1).unwrap();
+                buffer.write_u32(ttl).unwrap();
+
+                let pos = buffer.pos();
+                buffer.write_u16(0).unwrap();
+
+                buffer.write_qname(host).unwrap();
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16).unwrap();
+            }
+            DnsRecord::MX {
+                ref domain,
+                priority,
+                ref host,
+                ttl,
+            } => {
+                buffer.write_qname(domain).unwrap();
+                buffer.write_u16(QueryType::MX.to_u16()).unwrap();
+                buffer.write_u16(1).unwrap();
+                buffer.write_u32(ttl).unwrap();
+
+                let pos = buffer.pos();
+                buffer.write_u16(0).unwrap();
+
+                buffer.write_u16(priority).unwrap();
+                buffer.write_qname(host).unwrap();
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16).unwrap();
+            }
+            DnsRecord::AAAA {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                buffer.write_qname(domain).unwrap();
+                buffer.write_u16(QueryType::AAAA.to_u16()).unwrap();
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(16)?;
+
+                for octet in &addr.segments() {
+                    buffer.write_u16(*octet)?;
+                }
             }
             DnsRecord::UNKNOWN { .. } => {
                 println!("Skipping record: {:?}", self);
@@ -502,8 +675,8 @@ impl DnsPacket {
 }
 
 fn main() -> Result<(), String> {
-    let qname = "google.com";
-    let qtype = QueryType::A;
+    let qname = "yahoo.com";
+    let qtype = QueryType::MX;
 
     let server = ("8.8.8.8", 53);
     let socket = UdpSocket::bind(("0.0.0.0", 43210)).unwrap();
@@ -512,16 +685,20 @@ fn main() -> Result<(), String> {
     packet.header.id = 6666;
     packet.header.questions = 1;
     packet.header.recursion_desired = true;
-    packet.questions.push(DnsQuestion::new(qname.to_string(), qtype));
+    packet
+        .questions
+        .push(DnsQuestion::new(qname.to_string(), qtype));
 
     let mut req_buffer = BytePacketBuffer::new();
     packet.write(&mut req_buffer).unwrap();
-    socket.send_to(&req_buffer.buf[0..req_buffer.pos], server).unwrap();
-    
+    socket
+        .send_to(&req_buffer.buf[0..req_buffer.pos], server)
+        .unwrap();
+
     let mut res_buffer = BytePacketBuffer::new();
     socket.recv_from(&mut res_buffer.buf).unwrap();
     let res_packet = DnsPacket::from_buffer(&mut res_buffer).unwrap();
-    
+
     println!("{:#?}", res_packet.header);
 
     for q in res_packet.questions {
